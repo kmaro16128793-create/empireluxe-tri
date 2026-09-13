@@ -1,0 +1,61 @@
+name: Empire auxiliary layouts
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-auxiliary-capture.yml']
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - run: |
+          pip -q install playwright cryptography
+          python -m playwright install --with-deps chromium >/dev/null
+      - name: Capture the reference layouts without any order or payment
+        run: |
+          python - <<'PY'
+          import json,io,zipfile,os
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          o=Path('evidence');o.mkdir();report=[]
+          with sync_playwright() as pw:
+            b=pw.chromium.launch();c=b.new_context(viewport={'width':390,'height':844},locale='fr-FR');p=c.new_page()
+            for label,path in [('search','/search?q=cloudtilt'),('search-empty','/search'),('cart','/cart')]:
+              try:
+                r=p.goto('https://on-cloudtilt.fr'+path,wait_until='domcontentloaded',timeout=30000);p.wait_for_timeout(1200)
+                (o/(label+'.html')).write_text(p.content());report.append({'page':label,'status':r.status})
+                p.add_style_tag(content='[id^="NewsletterPopup-"],#shopify-pc__banner{display:none!important}');p.screenshot(path=str(o/(label+'.png')),full_page=True)
+              except Exception as e:report.append({'page':label,'error':str(e)})
+            try:
+              result=p.evaluate('''async()=>{const r=await fetch('/cart/add.js',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:57586399904127,quantity:1})});return {status:r.status,body:await r.text()}}''')
+              report.append({'session_cart_seed':result})
+              r=p.goto('https://on-cloudtilt.fr/cart',wait_until='domcontentloaded',timeout=30000);p.wait_for_timeout(1200)
+              (o/'cart-filled.html').write_text(p.content());p.add_style_tag(content='[id^="NewsletterPopup-"],#shopify-pc__banner{display:none!important}');p.screenshot(path=str(o/'cart-filled.png'),full_page=True)
+            except Exception as e:report.append({'cart_error':str(e)})
+            b.close()
+          (o/'report.json').write_text(json.dumps(report))
+          public=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0ATkEbvF8/Ft/WXE4CD2
+          6296a0p2Q9+IvRX5MoR5XcLBPPighmHTiE9yUWBvLdVr6xNPrIxW1gnl4nfH7fi9
+          Kuv2zBHcHr7mkVH1lYWZMfrAnUPF4Dwh8v6Mq3UoSl08oOXnxUEVs2EJsc6dJfuY
+          kpbqDNhH0+/yxSPhYbgrqvQHwxlYraZtUuXw0DvOyEKu8OlcGFaRByhfRoE+08Lc
+          tcWwNFlFfsrisHsu+vwg7O7WK5ub6kOD8gMAN2iQJyBOBo8zSZmRuDvAXUDQB98o
+          IGWEspZeSAQ5JkwE/OObpZQlBbvpMzwQ3Fwljbg12LW0CdTlAX6yy+63WowHgLBL
+          swIDAQAB
+          -----END PUBLIC KEY-----'''
+          pub=serialization.load_pem_public_key(public);buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            for f in o.iterdir():z.write(f,f.name)
+          key=AESGCM.generate_key(bit_length=256);nonce=os.urandom(12);ek=pub.encrypt(key,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('evidence.bin').write_bytes(b'EQA1'+ek+nonce+AESGCM(key).encrypt(nonce,buf.getvalue(),b'empire-qa'))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: empire-auxiliary-layouts
+          path: evidence.bin
+          retention-days: 1
