@@ -1,0 +1,111 @@
+name: Empire completion repair
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-completion-repair.yml']
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install tools
+        run: |
+          pip -q install requests beautifulsoup4 playwright cryptography
+          python -m playwright install --with-deps chromium >/dev/null
+      - name: Capture dependencies without modifying either storefront
+        run: |
+          python -u - <<'PY'
+          from pathlib import Path
+          import requests,json,hashlib,concurrent.futures,time,re,io,zipfile,os
+          from urllib.parse import urljoin,urlsplit
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          O=Path('evidence');O.mkdir();(O/'http').mkdir();(O/'pages').mkdir()
+          D='https://empireluxe.fr';R='https://on-cloudtilt.fr';T='205091570007'
+          headers={'User-Agent':'Mozilla/5.0','Accept-Language':'fr-FR,fr;q=0.9'}
+          def get(u):
+            r=requests.get(u,headers=headers,timeout=20);r.raise_for_status();return r
+          def save(n,v):
+            p=O/n;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(v if isinstance(v,str) else json.dumps(v,ensure_ascii=False),encoding='utf8')
+          manifest=get(D+'/cdn/shop/t/4/assets/empire-reference-manifest.json').json();save('manifest.json',manifest)
+          for n in ['empire-routes.json','empire-demo-catalogue.json','empire-source-theme.js','empire-source-theme.css','empire-source-vendor.js','empire-preview-runtime.js','empire-source-preview.js','empire-logo-integration.css']:
+            try:save(n,get(D+'/cdn/shop/t/4/assets/'+n).text)
+            except Exception as e:save(n+'.error',str(e))
+          routes=manifest['pages'];lookup={p['path']:p['view'] for p in routes}
+          def pair(p):
+            v=p['view'];path=p['path'];out={'path':path,'view':v}
+            try:
+              a=get(R+path);b=get(D+'/?preview_theme_id='+T+'&view='+v)
+              save('pages/ref-'+v+'.html',a.text);save('pages/draft-'+v+'.html',b.text)
+              sa=BeautifulSoup(a.text,'html.parser');sb=BeautifulSoup(b.text,'html.parser')
+              out['statuses']=[a.status_code,b.status_code]
+              out['draft_theme']=re.findall(r'Shopify.theme\s*=\s*([^;]+)',b.text)[:1]
+              out['reviews']=[len(x.select('.nolya-review-card')) for x in [sa,sb]]
+              out['errors']=re.findall(r'Liquid (?:error|syntax error)[^<\n]+',b.text)
+              if path.startswith('/products/'):
+                try:save('products/'+path.split('/')[-1]+'.json',get(R+path+'.js').json())
+                except Exception as e:out['product_error']=str(e)
+            except Exception as e:out['error']=str(e)
+            return out
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:results=list(ex.map(pair,routes))
+          save('route-status.json',results);print('Captured',len(results),'routes',flush=True)
+          for key,path in [('home','/'),('cart','/cart'),('search','/search?q=cloudtilt'),('search-empty','/search'),('contact','/pages/contact')]:
+            for side,base in [('ref',R),('draft',D)]:
+              try:save(side+'-'+key+'.html',get(base+path+('&' if '?' in path else '?')+('preview_theme_id='+T if side=='draft' else 'capture=complete')).text)
+              except Exception as e:save(side+'-'+key+'.error',str(e))
+          network={};metrics=[]
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch()
+            def response(r):
+              u=r.url;ct=r.headers.get('content-type','')
+              if r.status!=200 or 'video' in ct or not any(s in ct for s in ['text/','json','javascript','image/','font/','woff','octet-stream']):return
+              try:
+                data=r.body()
+                if len(data)>6000000:return
+                name=hashlib.sha1(u.encode()).hexdigest();(O/'http'/name).write_bytes(data);network[u]={'file':'http/'+name,'type':ct,'status':200}
+              except:pass
+            for side,base in [('ref',R),('draft',D)]:
+              c=browser.new_context(viewport={'width':390,'height':844},locale='fr-FR')
+              for key,path in [('home','/'),('product','/products/cloudtilt-remix-sunstone-ivory-femme'),('second','/products/saucony-progrid-omni-9-premium-grey'),('shoes','/collections/chaussures')]:
+                p=c.new_page();p.on('response',response);errs=[];p.on('pageerror',lambda e,arr=errs:arr.append(str(e)))
+                u=base+path if side=='ref' else D+'/?preview_theme_id='+T+('&view='+lookup[path] if path!='/' else '')
+                try:
+                  p.goto(u,wait_until='domcontentloaded',timeout=30000);p.wait_for_timeout(1400)
+                  p.add_style_tag(content='#shopify-pc__banner,#shopify-preview-bar-iframe,[id^="NewsletterPopup-"]{display:none!important}')
+                  for y in range(0,min(p.evaluate('document.documentElement.scrollHeight'),18000),700):p.evaluate('(y)=>scrollTo(0,y)',y);p.wait_for_timeout(80)
+                  p.wait_for_timeout(1200);p.evaluate('scrollTo(0,0)');p.screenshot(path=str(O/(side+'-'+key+'-390.png')),full_page=True,timeout=20000)
+                  save('rendered-'+side+'-'+key+'.html',p.content())
+                  metrics.append({'side':side,'page':key,'errors':errs,'recents':p.locator('[data-section-type="recently-viewed"]').count(),'height':p.evaluate('document.documentElement.scrollHeight')})
+                except Exception as e:metrics.append({'side':side,'page':key,'error':str(e)})
+                p.close()
+              c.close()
+            browser.close()
+          save('network.json',network);save('metrics.json',metrics)
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          public=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0ATkEbvF8/Ft/WXE4CD2
+          6296a0p2Q9+IvRX5MoR5XcLBPPighmHTiE9yUWBvLdVr6xNPrIxW1gnl4nfH7fi9
+          Kuv2zBHcHr7mkVH1lYWZMfrAnUPF4Dwh8v6Mq3UoSl08oOXnxUEVs2EJsc6dJfuY
+          kpbqDNhH0+/yxSPhYbgrqvQHwxlYraZtUuXw0DvOyEKu8OlcGFaRByhfRoE+08Lc
+          tcWwNFlFfsrisHsu+vwg7O7WK5ub6kOD8gMAN2iQJyBOBo8zSZmRuDvAXUDQB98o
+          IGWEspZeSAQ5JkwE/OObpZQlBbvpMzwQ3Fwljbg12LW0CdTlAX6yy+63WowHgLBL
+          swIDAQAB
+          -----END PUBLIC KEY-----'''
+          pub=serialization.load_pem_public_key(public);buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            for f in O.rglob('*'):
+              if f.is_file():z.write(f,str(f.relative_to(O)))
+          key=AESGCM.generate_key(bit_length=256);nonce=os.urandom(12)
+          ek=pub.encrypt(key,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('evidence.bin').write_bytes(b'EQA1'+ek+nonce+AESGCM(key).encrypt(nonce,buf.getvalue(),b'empire-qa'))
+          print('Encrypted repair inputs ready',flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: empire-completion-inputs
+          path: evidence.bin
+          retention-days: 1
