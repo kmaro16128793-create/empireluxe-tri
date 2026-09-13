@@ -1,0 +1,80 @@
+name: Saved logo verification
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/logo-saved-verification.yml']
+permissions:
+  contents: read
+jobs:
+  logo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install browser tools
+        run: |
+          pip -q install playwright cryptography
+          python -m playwright install chromium --with-deps
+      - name: Verify deployed stylesheet and capture real Shopify rendering
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import io,json,os,zipfile
+          from playwright.sync_api import sync_playwright
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          out=Path('evidence');out.mkdir()
+          findings=[]
+          measure='''() => {const visible=e=>{let r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"};const box=e=>{let r=e.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height}};let logos=[...document.querySelectorAll('#SiteHeader .site-header__logo-link img')].filter(visible);let icons=[...document.querySelectorAll('#SiteHeader .site-nav__icons a,#SiteHeader .site-nav__icons button')].filter(visible);return {theme:Shopify.theme.id,role:Shopify.theme.role,viewport:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth+1,header:box(document.querySelector('#SiteHeader')),logos:logos.map(e=>({...box(e),filter:getComputedStyle(e).filter,natural:[e.naturalWidth,e.naturalHeight],src:e.currentSrc})),icons:icons.map(box),stylesheet:[...document.styleSheets].map(s=>s.href).filter(Boolean).find(s=>s.includes('empire-logo-integration'))}}'''
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True)
+            for page_type,view in [('home',''),('product','&view=p-91194e8eefcb')]:
+              context=browser.new_context(viewport={'width':390,'height':844},device_scale_factor=2)
+              page=context.new_page()
+              page.goto('https://empireluxe.fr/?preview_theme_id=205091570007&logo_saved=20260913b'+view,wait_until='domcontentloaded',timeout=45000)
+              page.wait_for_function("window.Shopify && String(Shopify.theme.id)==='205091570007' && [...document.styleSheets].some(s=>s.href && s.href.includes('empire-logo-integration'))",timeout=15000)
+              page.wait_for_timeout(2000)
+              page.add_style_tag(content='#NewsletterPopup-newsletter-popup,#shopify-pc__banner,#preview-bar-iframe{display:none!important}')
+              for w in ([320,375,390,430,768,769,1440] if page_type=='home' else [390,1440]):
+                page.set_viewport_size({'width':w,'height':844 if w<769 else 900})
+                page.evaluate('window.scrollTo(0,0)');page.wait_for_timeout(350)
+                page.wait_for_function("[...document.querySelectorAll('#SiteHeader .site-header__logo img')].every(e=>e.complete && e.naturalWidth>0)",timeout=15000)
+                m=page.evaluate(measure);m['page']=page_type;findings.append(m)
+                assert str(m['theme'])=='205091570007' and m['role']=='unpublished',m
+                assert len(m['logos'])==1,m
+                logo=m['logos'][0]
+                assert logo['filter']=='none',m
+                assert logo['x']>=0 and logo['x']+logo['w']<=w,m
+                assert abs(logo['w']/logo['h']-1573/662)<0.015,m
+                assert all(logo['x']+logo['w']<=i['x'] or logo['x']>=i['x']+i['w'] for i in m['icons']),m
+                if w in [390,1440]:
+                  page.screenshot(path=str(out/f'{page_type}-{w}.png'))
+              if page_type=='home':
+                page.set_viewport_size({'width':390,'height':844});page.evaluate('scrollTo(0,700)');page.wait_for_timeout(700);page.evaluate('scrollTo(0,600)');page.wait_for_timeout(700)
+                m=page.evaluate(measure);m['page']='home-scrolled';findings.append(m)
+                page.screenshot(path=str(out/'home-scrolled-390.png'))
+              context.close()
+            browser.close()
+          (out/'checks.json').write_text(json.dumps(findings,indent=2))
+          public=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA78QLPHk7PfDiDmAxMCfW
+          y49qjQNKg+75LefCNnkxqVEcpH17TUlJFXxjBAGQk2aCCRDhMX0M2Xbxv+fMuMOz
+          Qpk3B2chOiFCHwRnldNmYWV1367HLba8xMfHoEakbJvYE7EyxxAXGWCV661t7gvw
+          ZgGL+/gpIQtlqQw/7Da04lFDSh5s89kDeABfsh1g60WvE8fvhk3oBcqNeMvpvcub
+          oF4w2kqMwq+XunA8Bhvpu/V6Q4YSV/e3lb18WQQJsXcgYa2/O8uVYA5yjseuTKZP
+          pVdr73vGB85BRjHiIULiGKlz4EaKIBS4isoQn892Z3Te4jwYgxfmOZc7q6s8ngSq
+          RwIDAQAB
+          -----END PUBLIC KEY-----'''
+          z=io.BytesIO()
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED) as f:
+            for v in out.iterdir():f.write(v,v.name)
+          k=AESGCM.generate_key(bit_length=256);n=os.urandom(12);pk=serialization.load_pem_public_key(public)
+          ek=pk.encrypt(k,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('logo-saved.bin').write_bytes(b'EQA1'+ek+n+AESGCM(k).encrypt(n,z.getvalue(),b'empire-qa'))
+          print('Saved Shopify logo verified; encrypted evidence ready')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logo-saved
+          path: logo-saved.bin
+          retention-days: 1
