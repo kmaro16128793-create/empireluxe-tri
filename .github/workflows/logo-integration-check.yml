@@ -1,0 +1,73 @@
+name: Logo integration check
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/logo-integration-check.yml']
+permissions:
+  contents: read
+jobs:
+  logo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Install browser tools
+        run: |
+          pip -q install playwright requests beautifulsoup4 cryptography
+          python -m playwright install chromium --with-deps
+      - name: Inspect exact draft logo
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import requests,json,re,io,zipfile,os
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          out=Path('evidence');out.mkdir()
+          base='https://empireluxe.fr/?preview_theme_id=205091570007&logo_check=1'
+          resources={'logo.png':'https://cdn.shopify.com/s/files/1/1030/5273/8903/files/empireluxe-logo-or3.png?v=1783992853','hero.png':'https://on-cloudtilt.fr/cdn/shop/files/ChatGPT_Image_13_aout_2026_00_30_17.png?v=1786573834&width=1086','theme.css':'https://empireluxe.fr/cdn/shop/t/4/assets/empire-source-theme.css'}
+          for name,url in resources.items():
+            try:
+              r=requests.get(url,timeout=20);r.raise_for_status();(out/name).write_bytes(r.content)
+            except Exception as e:(out/(name+'.error')).write_text(str(e))
+          findings=[]
+          patch='''#SiteHeader .header-item--logo{flex:0 0 110px!important;min-width:0}#SiteHeader .site-header__logo{margin:0!important;padding:0!important}#SiteHeader .site-header__logo-link{position:relative!important;width:110px!important;height:auto!important;padding:0!important;line-height:0!important;background:transparent!important;border:0!important;box-shadow:none!important;backdrop-filter:none!important}#SiteHeader .site-header__logo-link img{position:static!important;width:100%!important;height:auto!important;max-width:100%!important;max-height:none!important;object-fit:contain!important;filter:none!important;mix-blend-mode:normal!important;background:transparent!important;border:0!important;box-shadow:none!important}#SiteHeader .site-header__logo-link:before,#SiteHeader .site-header__logo-link:after{display:none!important}#SiteHeader{box-shadow:none!important}@media(min-width:769px){#SiteHeader .header-item--logo{flex-basis:180px!important}#SiteHeader .site-header__logo-link{width:180px!important}}'''
+          with sync_playwright() as p:
+            b=p.chromium.launch(headless=True)
+            for w,h in [(390,844),(1440,900)]:
+              c=b.new_context(viewport={'width':w,'height':h},device_scale_factor=1)
+              pg=c.new_page();pg.goto(base,wait_until='domcontentloaded',timeout=45000);pg.wait_for_timeout(2000)
+              pg.add_style_tag(content='#NewsletterPopup-newsletter-popup,#shopify-pc__banner,#preview-bar-iframe{display:none!important}')
+              assert str(pg.evaluate('window.Shopify.theme.id'))=='205091570007'
+              pg.screenshot(path=str(out/f'before-{w}.png'))
+              (out/f'draft-{w}.html').write_text(pg.content())
+              findings.append({'w':w,'before':pg.evaluate('''() => [...document.querySelectorAll('#SiteHeader,#HeaderWrapper,#SiteHeader .header-item--logo,#SiteHeader .site-header__logo-link,#SiteHeader .site-header__logo img')].map(e=>{let c=getComputedStyle(e),r=e.getBoundingClientRect();return {tag:e.tagName,cl:e.className,src:e.src,box:{x:r.x,y:r.y,w:r.width,h:r.height},natural:[e.naturalWidth,e.naturalHeight],display:c.display,filter:c.filter,bg:c.background,shadow:c.boxShadow,position:c.position,pad:c.padding}})''')})
+              pg.add_style_tag(content=patch);pg.wait_for_timeout(100);pg.screenshot(path=str(out/f'candidate-{w}.png'))
+              findings[-1]['candidate']=pg.evaluate('''() => ({overflow:document.documentElement.scrollWidth>innerWidth,logos:[...document.querySelectorAll('#SiteHeader .site-header__logo img')].filter(e=>e.getBoundingClientRect().height&&getComputedStyle(e).display!=='none').map(e=>{let r=e.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,filter:getComputedStyle(e).filter}})})''')
+              c.close()
+            b.close()
+          (out/'findings.json').write_text(json.dumps(findings,indent=2))
+          (out/'candidate.css').write_text(patch)
+          public=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA78QLPHk7PfDiDmAxMCfW
+          y49qjQNKg+75LefCNnkxqVEcpH17TUlJFXxjBAGQk2aCCRDhMX0M2Xbxv+fMuMOz
+          Qpk3B2chOiFCHwRnldNmYWV1367HLba8xMfHoEakbJvYE7EyxxAXGWCV661t7gvw
+          ZgGL+/gpIQtlqQw/7Da04lFDSh5s89kDeABfsh1g60WvE8fvhk3oBcqNeMvpvcub
+          oF4w2kqMwq+XunA8Bhvpu/V6Q4YSV/e3lb18WQQJsXcgYa2/O8uVYA5yjseuTKZP
+          pVdr73vGB85BRjHiIULiGKlz4EaKIBS4isoQn892Z3Te4jwYgxfmOZc7q6s8ngSq
+          RwIDAQAB
+          -----END PUBLIC KEY-----'''
+          z=io.BytesIO()
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED) as f:
+            for v in out.iterdir():f.write(v,v.name)
+          k=AESGCM.generate_key(bit_length=256);n=os.urandom(12);pk=serialization.load_pem_public_key(public)
+          ek=pk.encrypt(k,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('logo-evidence.bin').write_bytes(b'EQA1'+ek+n+AESGCM(k).encrypt(n,z.getvalue(),b'empire-qa'))
+          print('Encrypted logo evidence ready')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logo-evidence
+          path: logo-evidence.bin
+          retention-days: 1
