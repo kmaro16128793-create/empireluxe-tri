@@ -1,0 +1,74 @@
+name: Build reference data
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/reference-data-build-20260914.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - run: pip -q install requests beautifulsoup4 cryptography
+      - name: Collect exact source recommendation cards
+        run: |
+          cat > /tmp/build.py <<'PY'
+          import requests,json,time,io,zipfile,os,gzip,base64,re
+          from pathlib import Path
+          from bs4 import BeautifulSoup,Comment
+          O=Path('evidence');O.mkdir();session=requests.Session();R='https://on-cloudtilt.fr';D='https://empireluxe.fr';last=0
+          def get(u):
+            global last
+            time.sleep(max(0,1.1-(time.monotonic()-last)));r=session.get(u,timeout=25);last=time.monotonic()
+            if r.status_code==429:
+              time.sleep(min(65,max(30,int(r.headers.get('Retry-After','60')))));r=session.get(u,timeout=25);last=time.monotonic()
+            r.raise_for_status();return r.content.decode('utf-8')
+          routes=json.loads(get(D+'/cdn/shop/t/4/assets/empire-routes.json?reference_data=20260914'))
+          products=json.loads(get(R+'/products.json?limit=250'))['products']
+          selected=[p for p in products if '/products/'+p['handle'] in routes]
+          (O/'source-products.json').write_text(json.dumps(selected,ensure_ascii=False))
+          data={'styles':[],'cards':{},'recommendations':{},'missingHandles':[]};errors=[];css=set()
+          for index,p in enumerate(selected):
+            try:
+              # Recommendations are used on the original apparel/accessory and multi-colour product templates.
+              if not (p.get('product_type','').lower() in ['apparel','accessories','accessory'] or any(x in p['handle'] for x in ['cap','club-','court','short','pants','shirt','jacket','vest','cloudmonster','cloudrunner','cloudvista'])):continue
+              h=get(R+'/recommendations/products?section_id=product-recommendations&limit=5&product_id='+str(p['id']));s=BeautifulSoup(h,'html.parser');block=s.select_one('.product-recommendations');sequence=[]
+              if block:
+                for style in block.select('style'):
+                  text=style.get_text();css.add(text)
+                for card in block.select('.grid-product[data-product-handle]'):
+                  handle=card['data-product-handle'];sequence.append(handle)
+                  for x in card.select('script,noscript'):x.decompose()
+                  for c in card.find_all(string=lambda t:isinstance(t,Comment)):c.extract()
+                  data['cards'][handle]=re.sub(r'>\s+<','><',str(card))
+                  if '/products/'+handle not in routes:data['missingHandles'].append(handle)
+              data['recommendations'][str(p['id'])]=sequence
+            except Exception as e:errors.append({'handle':p['handle'],'error':str(e)})
+          data['styles']=list(css);data['missingHandles']=sorted(set(data['missingHandles']))
+          raw=json.dumps(data,ensure_ascii=False,separators=(',',':')).encode();payload=base64.b64encode(gzip.compress(raw,compresslevel=9)).decode()
+          (O/'recommendation-data.json').write_bytes(raw);(O/'recommendation-data.b64').write_text(payload);(O/'errors.json').write_text(json.dumps(errors));print('Models',len(selected),'Recommendation sets',len(data['recommendations']),'Unique cards',len(data['cards']),'Payload',len(payload),'Errors',len(errors))
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtG/6ZvkMwGrQ5KCE+duj
+          T25ZWOM2v3L3dE14jMMhM1lUioUdNxlzDOBozjfHZglnuGCRN5aAwr4h7yP08MlT
+          xH3m9b8K51Jx4mMoMHco8C0cuI/6HCf0ks29HOh7rUB8smOhKE4vAC9gjd8ev/Lw
+          Qhbv1o+mb680CK1jgxHACr0hRNTwm76g9CBLmrj1xhAdiBp/P/FW9eWblPBNdqZF
+          GI5qopC1+4Qrgiv1+9TJQRn7UOXtV33PfuniEaTPvB2udSz/YMZjIXizoy5rG0jX
+          9bmC2/SSFJd4UyJK9/+ePFYA91NSHWo+oZrbAPp5WWff6Tofm0w8feUozI5T36o2
+          NQIDAQAB
+          -----END PUBLIC KEY-----'''
+          buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in O.iterdir():z.write(p,p.name)
+          key=AESGCM.generate_key(bit_length=256);n=os.urandom(12);ek=serialization.load_pem_public_key(pub).encrypt(key,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('reference-data.bin').write_bytes(b'EQA1'+ek+n+AESGCM(key).encrypt(n,buf.getvalue(),b'empire-qa'))
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exact-reference-data
+          path: reference-data.bin
+          retention-days: 2
