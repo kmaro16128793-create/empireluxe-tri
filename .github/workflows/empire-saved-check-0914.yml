@@ -1,0 +1,109 @@
+name: Empire saved checks
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-saved-check-0914.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Browser dependencies
+        run: |
+          pip -q install requests beautifulsoup4 cryptography playwright
+          python -m playwright install --with-deps chromium >/dev/null
+      - name: Verify saved draft
+        run: |
+          cat > /tmp/check.py <<'PY'
+          from pathlib import Path
+          import requests,json,re,time,hashlib,base64,gzip,traceback
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          O=Path('evidence');O.mkdir();D='https://empireluxe.fr';R='https://on-cloudtilt.fr';T='205091570007'
+          def put(n,v):
+            p=O/n;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(v if isinstance(v,str) else json.dumps(v,ensure_ascii=False,indent=2),encoding='utf-8')
+          def get(url):
+            r=requests.get(url,timeout=25);r.raise_for_status();r.encoding='utf-8';return r.text
+          routes=json.loads(get(D+'/cdn/shop/t/4/assets/empire-routes.json'))
+          js=get(D+'/cdn/shop/t/4/assets/empire-recommendations-data.js?verify=0914');put('saved-data.js',js)
+          parts=re.search(r'const encoded=(\[.*?\])\.join',js,re.S)
+          raw=base64.b64decode(''.join(json.loads(parts.group(1))));assert hashlib.md5(raw).hexdigest()=='a793671c502366d830168ecad9bc5b11','Data checksum mismatch'
+          data=json.loads(gzip.decompress(raw));assert len(data['recommendations'])==51
+          put('data-check.json',{'compressedChecksum':hashlib.md5(raw).hexdigest(),'sets':len(data['recommendations']),'cards':len(data['cards'])})
+          for n in ['empire-reference-bridge.js','empire-preview-runtime.js','empire-source-preview.js','empire-search.js']:put('assets/'+n,get(D+'/cdn/shop/t/4/assets/'+n))
+          def du(path=''):
+            route=routes.get(path,path) or '/'
+            return D+route+('&' if '?' in route else '?')+'preview_theme_id='+T+'&saved_check=0914b'
+          report=[];tests=[]
+          paths=[('home','/'),('product','/products/cloudtilt-remix-sunstone-ivory-femme'),('clothes','/products/club-t'),('collection','/collections/chaussures'),('cart','/cart'),('search','/search?q=cloudtilt')]
+          hide='#shopify-pc__banner,#shopify-preview-bar-iframe,#OnlineStorePreviewBarIframe,[id^="NewsletterPopup-"]{display:none!important}html,body{scroll-behavior:auto!important}'
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True)
+            for w in [390,1440]:
+              contexts={s:browser.new_context(viewport={'width':w,'height':850},locale='fr-FR') for s in ['reference','draft']}
+              for label,path in paths:
+                for side in ['reference','draft']:
+                  page=contexts[side].new_page();page.set_default_timeout(6000);errs=[];failed=[];result={'page':label,'side':side,'width':w}
+                  page.on('pageerror',lambda e:errs.append(str(e)));page.on('response',lambda r:failed.append({'url':r.url,'status':r.status}) if r.status>=400 else None)
+                  try:
+                    page.goto(R+path if side=='reference' else du(path),wait_until='domcontentloaded',timeout=30000);page.wait_for_timeout(1600);page.add_style_tag(content=hide)
+                    page.evaluate("document.documentElement.classList.remove('modal-open');document.body.classList.remove('modal-open')")
+                    for y in range(0,min(page.evaluate('document.documentElement.scrollHeight'),15000),700):page.evaluate('(y)=>scrollTo(0,y)',y);page.wait_for_timeout(80)
+                    page.wait_for_timeout(1100);page.evaluate("document.querySelectorAll('video').forEach(v=>v.pause());scrollTo(0,0)");page.wait_for_timeout(100)
+                    result['metrics']=page.evaluate('''()=>({theme:window.Shopify?.theme,overflow:document.documentElement.scrollWidth>innerWidth,height:document.documentElement.scrollHeight,headings:[...document.querySelectorAll('main h1,main h2,main h3')].map(e=>({text:e.textContent.trim(),y:e.getBoundingClientRect().y,h:e.getBoundingClientRect().height})),recent:[...document.querySelectorAll('[data-section-type="recently-viewed"]')].map(e=>({visible:!!e.getBoundingClientRect().height,cards:e.querySelectorAll('.grid-product').length,text:e.innerText})),recommendations:[...document.querySelectorAll('[data-section-type="product-recommendations"]')].map(e=>({pid:e.dataset.productId,visible:!!e.getBoundingClientRect().height,cards:e.querySelectorAll('.grid-product').length,names:[...e.querySelectorAll('.grid-product__title')].map(x=>x.textContent.trim())})),reviews:[...document.querySelectorAll('.nolya-review-card')].map(e=>e.innerText),broken:[...document.images].filter(i=>i.complete&&!i.naturalWidth&&i.getBoundingClientRect().width>0).map(i=>i.currentSrc),runtime:window.EmpirePreview?.version,bridge:window.EmpirePreview?.referenceBridgeVersion})''')
+                    base=f'{label}-{w}-{side}';put('rendered/'+base+'.html',page.content());page.screenshot(path=str(O/(base+'.png')),full_page=True,animations='disabled',timeout=20000)
+                    if side=='draft':
+                      assert str(result['metrics']['theme']['id'])==T,'Wrong Shopify theme'
+                      if label=='home':
+                        page.locator('.js-drawer-open-nav:visible').click();page.wait_for_timeout(250);tests.append({'width':w,'test':'menu opens','pass':page.locator('#NavDrawer').evaluate("e=>e.classList.contains('drawer--is-open')")});page.locator('#NavDrawer .js-drawer-close').click()
+                      if label=='product':
+                        inp=page.locator('input[data-variant-input][value="42"]');iid=inp.get_attribute('id');page.locator('label[for="'+iid+'"]').click();page.locator('form[data-empire-preview-product] button[name="add"]').click();page.wait_for_timeout(300)
+                        state=page.evaluate('window.EmpirePreviewCart.snapshot()');tests.append({'width':w,'test':'size 42 to cart','pass':state['item_count']==1 and str(state['items'][0]['variant'])=='42','state':state})
+                        page.screenshot(path=str(O/(base+'-cart.png')),animations='disabled')
+                        page.locator('#CartDrawer [data-empire-qty="1"]').first.click();state=page.evaluate('window.EmpirePreviewCart.snapshot()');tests.append({'width':w,'test':'cart quantity +','pass':state['item_count']==2})
+                        page.locator('#CartDrawer [data-empire-qty="-1"]').first.click();state=page.evaluate('window.EmpirePreviewCart.snapshot()');tests.append({'width':w,'test':'cart quantity -','pass':state['item_count']==1})
+                      if label=='clothes':
+                        rec=page.locator('[data-section-type="product-recommendations"]');tests.append({'width':w,'test':'clothes recommendations','pass':rec.locator('.grid-product').count()==5});tests.append({'width':w,'test':'recent product','pass':page.locator('[data-section-type="recently-viewed"] .grid-product').count()>=1})
+                      if label=='cart':
+                        tests.append({'width':w,'test':'cart page persists item','pass':page.locator('#EmpireCartPage [data-empire-line]').count()==1});page.locator('#EmpireCartPage [data-empire-remove]').first.click();tests.append({'width':w,'test':'cart removal','pass':page.evaluate('window.EmpirePreviewCart.snapshot().item_count')==0})
+                      if label=='search':tests.append({'width':w,'test':'search returns cards','pass':page.locator('#EmpireSearchOutput .grid-product').count()==12})
+                  except Exception as e:result['error']=str(e)[:450]
+                  result['errors']=errs;result['failedRequests']=failed;report.append(result);put('report.json',report);put('tests.json',tests);page.close()
+              for c in contexts.values():c.close()
+            browser.close()
+          print('Captured pages:',len(report),'tests:',len(tests),'passed:',sum(t.get('pass',False) for t in tests),'page failures:',sum('error' in r for r in report))
+          PY
+          python /tmp/check.py
+      - name: Encrypt saved proof
+        if: always()
+        run: |
+          python - <<'PY'
+          import io,zipfile,os
+          from pathlib import Path
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsgRG3rddyMv6rF4wzvG6
+          YcOwULAbhSDGWNkkwSOq9wWfjhGq3PpxsVWwjCp8l8Ng5kbXMtHW6oEfjedFY69c
+          yp+/tQTaRA6h+vi5Gky9lobksxifykUyJ/CB2OjMEUPJBx/hyuepd5wFxo9xrYyW
+          f+d9hhYMsnTcmfNs+8bD2BwbaoO/jqeNltKkYTwgd1WnjOZvWrguGpxA18Q6uw/Q
+          PYTmgC8bXFChxtqyyae/8FaZCP9AAbWLJ6b8SxCkor4MBEBQzALtDUGUQrz24DFy
+          bFhQ2rpC0IIwX5RdoT5H+TyOs8KwkzACWboob6XJdIXvFrCxRYoIOcyqy3owjuZ2
+          MwIDAQAB
+          -----END PUBLIC KEY-----'''
+          b=io.BytesIO()
+          with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in Path('evidence').rglob('*'):
+              if p.is_file():z.write(p,str(p.relative_to('evidence')))
+          k=AESGCM.generate_key(bit_length=256);n=os.urandom(12);ek=serialization.load_pem_public_key(pub).encrypt(k,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('saved.bin').write_bytes(b'EQA1'+ek+n+AESGCM(k).encrypt(n,b.getvalue(),b'empire-qa'))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: saved-completion-evidence
+          path: saved.bin
+          retention-days: 2
