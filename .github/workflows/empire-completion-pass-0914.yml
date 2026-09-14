@@ -1,0 +1,118 @@
+name: Empire completion pass
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-completion-pass-0914.yml']
+permissions:
+  contents: read
+jobs:
+  complete-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install browser
+        run: |
+          pip -q install requests beautifulsoup4 cryptography playwright
+          python -m playwright install --with-deps chromium > /dev/null
+      - name: Collect and render
+        run: |
+          cat > /tmp/pass.py <<'PY'
+          import requests,json,time,re,io,zipfile,os,traceback
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup,Comment
+          from playwright.sync_api import sync_playwright
+          O=Path('evidence');O.mkdir();R='https://on-cloudtilt.fr';D='https://empireluxe.fr';T='205091570007';last=0
+          def put(n,v):
+            p=O/n;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(v if isinstance(v,str) else json.dumps(v,ensure_ascii=False,indent=2),encoding='utf-8')
+          def get(u):
+            global last
+            time.sleep(max(0,0.8-(time.monotonic()-last)));r=requests.get(u,timeout=25);last=time.monotonic();r.raise_for_status();r.encoding='utf-8';return r.text
+          def du(view=''):return D+'/?preview_theme_id='+T+('&view='+view if view else '')+'&completion_pass=0914a'
+          assets=['empire-routes.json','empire-demo-catalogue.json','empire-reference-manifest.json','empire-source-theme.js','empire-source-theme.css','empire-preview-runtime.js','empire-source-preview.js','empire-search.js','empire-search.css','empire-logo-integration.css']
+          for a in assets:
+            try:put('assets/'+a,get(D+'/cdn/shop/t/4/assets/'+a))
+            except Exception as e:put('assets/'+a+'.error.txt',str(e))
+          routes=json.loads((O/'assets/empire-routes.json').read_text());products=json.loads(get(R+'/products.json?limit=250'))['products'];put('source-products.json',products)
+          data={'styles':[],'cards':{},'recommendations':{},'missingHandles':[]};css=set();errs=[]
+          for p in products:
+            if '/products/'+p['handle'] not in routes:continue
+            if not(p.get('product_type','').lower() in ['apparel','accessories','accessory'] or any(x in p['handle'] for x in ['cap','club-','court','short','pants','shirt','jacket','vest','cloudmonster','cloudrunner','cloudvista'])):continue
+            try:
+              h=get(R+'/recommendations/products?section_id=product-recommendations&limit=5&product_id='+str(p['id']));s=BeautifulSoup(h,'html.parser');block=s.select_one('.product-recommendations');seq=[]
+              if block:
+                for x in block.select('style'):css.add(x.get_text())
+                for c in block.select('.grid-product[data-product-handle]'):
+                  handle=c['data-product-handle'];seq.append(handle)
+                  for x in c.select('script,noscript'):x.decompose()
+                  for x in c.find_all(string=lambda t:isinstance(t,Comment)):x.extract()
+                  data['cards'][handle]=re.sub(r'>\s+<','><',str(c))
+                  if '/products/'+handle not in routes:data['missingHandles'].append(handle)
+              data['recommendations'][str(p['id'])]=seq
+            except Exception as e:errs.append({'handle':p['handle'],'error':str(e)})
+          data['styles']=sorted(css);data['missingHandles']=sorted(set(data['missingHandles']));put('recommendation-data.json',data);put('source-errors.json',errs)
+          samples=[('home',''),('product','/products/cloudtilt-remix-sunstone-ivory-femme'),('clothes','/products/club-t'),('collection','/collections/chaussures'),('cart','/cart'),('search','/search?q=cloudtilt')]
+          hide='#shopify-pc__banner,#shopify-preview-bar-iframe,#OnlineStorePreviewBarIframe,[id^="NewsletterPopup-"]{display:none!important}html,body{scroll-behavior:auto!important}'
+          report=[]
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True)
+            for w in [390,1440]:
+              contexts={side:browser.new_context(viewport={'width':w,'height':850},locale='fr-FR') for side in ['reference','draft']}
+              for label,path in samples:
+                if path.startswith('/products/') and path not in routes:continue
+                for side in ['reference','draft']:
+                  page=contexts[side].new_page();page.set_default_timeout(5000);errors=[];failed=[]
+                  page.on('pageerror',lambda e:errors.append(str(e)[:220]));page.on('response',lambda r:failed.append({'url':r.url,'status':r.status}) if r.status>=400 else None)
+                  u=R+(path or '/') if side=='reference' else du(routes.get(path,'')) if not path.startswith(('/search','/cart')) else D+path+('&' if '?' in path else '?')+'preview_theme_id='+T
+                  base=f'{label}-{w}-{side}';result={'page':label,'width':w,'side':side,'url':u}
+                  try:
+                    page.goto(u,wait_until='domcontentloaded',timeout=25000);page.wait_for_timeout(1600);page.add_style_tag(content=hide)
+                    page.evaluate("document.documentElement.classList.remove('modal-open');document.body.classList.remove('modal-open')")
+                    for y in range(0,min(page.evaluate('document.documentElement.scrollHeight'),13000),700):page.evaluate('(y)=>scrollTo(0,y)',y);page.wait_for_timeout(70)
+                    page.wait_for_timeout(700);page.evaluate("document.querySelectorAll('video').forEach(v=>v.pause());scrollTo(0,0)");page.wait_for_timeout(150)
+                    result['metrics']=page.evaluate('''()=>({theme:window.Shopify?.theme,overflow:document.documentElement.scrollWidth>innerWidth,height:document.documentElement.scrollHeight,headings:[...document.querySelectorAll('main h1,main h2,main h3')].map(e=>({text:e.textContent.trim(),y:e.getBoundingClientRect().y,h:e.getBoundingClientRect().height})),recent:[...document.querySelectorAll('[data-section-type="recently-viewed"]')].map(e=>({visible:!!e.getBoundingClientRect().height,cards:e.querySelectorAll('.grid-product').length,text:e.innerText})),recommendations:[...document.querySelectorAll('[data-section-type="product-recommendations"],.product-recommendations')].map(e=>({id:e.id,pid:e.dataset.productId,visible:!!e.getBoundingClientRect().height,cards:e.querySelectorAll('.grid-product').length,text:e.innerText.slice(0,900)})),reviews:document.querySelectorAll('.nolya-review-card').length,broken:[...document.images].filter(i=>i.complete&&!i.naturalWidth&&i.getBoundingClientRect().width>0).map(i=>i.currentSrc),runtime:window.EmpirePreview?.version})''')
+                    put('rendered/'+base+'.html',page.content());page.screenshot(path=str(O/(base+'.png')),full_page=True,animations='disabled',timeout=15000)
+                    if side=='draft' and label=='product':
+                      try:
+                        size=page.locator('input[data-variant-input][value="42"]');size.check(force=True);page.locator('form[data-empire-preview-product] button[name="add"]').click();page.wait_for_timeout(300)
+                        result['cartAfterAdd']=page.evaluate('window.EmpirePreviewCart.snapshot()');page.screenshot(path=str(O/(base+'-cart.png')),animations='disabled')
+                      except Exception as e:result['cartError']=str(e)[:180]
+                    if side=='draft' and str(result['metrics'].get('theme',{}).get('id'))!=T:result['wrongTheme']=True
+                  except Exception as e:result['error']=str(e)[:240]
+                  result['errors']=errors;result['failedRequests']=failed;report.append(result);page.close()
+              for c in contexts.values():c.close()
+            browser.close()
+          put('report.json',report);print('Captured',len(report),'pages. Recommendation sets:',len(data['recommendations']),'cards:',len(data['cards']),'source errors:',len(errs))
+          PY
+          python /tmp/pass.py
+      - name: Encrypt evidence
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import io,zipfile,os
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsgRG3rddyMv6rF4wzvG6
+          YcOwULAbhSDGWNkkwSOq9wWfjhGq3PpxsVWwjCp8l8Ng5kbXMtHW6oEfjedFY69c
+          yp+/tQTaRA6h+vi5Gky9lobksxifykUyJ/CB2OjMEUPJBx/hyuepd5wFxo9xrYyW
+          f+d9hhYMsnTcmfNs+8bD2BwbaoO/jqeNltKkYTwgd1WnjOZvWrguGpxA18Q6uw/Q
+          PYTmgC8bXFChxtqyyae/8FaZCP9AAbWLJ6b8SxCkor4MBEBQzALtDUGUQrz24DFy
+          bFhQ2rpC0IIwX5RdoT5H+TyOs8KwkzACWboob6XJdIXvFrCxRYoIOcyqy3owjuZ2
+          MwIDAQAB
+          -----END PUBLIC KEY-----'''
+          b=io.BytesIO()
+          with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in Path('evidence').rglob('*'):
+              if p.is_file():z.write(p,str(p.relative_to('evidence')))
+          k=AESGCM.generate_key(bit_length=256);n=os.urandom(12);ek=serialization.load_pem_public_key(pub).encrypt(k,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('completion.bin').write_bytes(b'EQA1'+ek+n+AESGCM(k).encrypt(n,b.getvalue(),b'empire-qa'))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: completion-evidence
+          path: completion.bin
+          retention-days: 2
