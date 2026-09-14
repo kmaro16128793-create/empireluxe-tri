@@ -1,0 +1,70 @@
+name: Reference route coverage
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/finish-inventory-20260914.yml']
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - run: pip -q install requests beautifulsoup4 cryptography
+      - name: Capture missing data
+        run: |
+          cat > /tmp/run.py <<'PY'
+          import requests,json,concurrent.futures,io,zipfile,os,re
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from urllib.parse import urlsplit
+          O=Path('evidence');O.mkdir();R='https://on-cloudtilt.fr';D='https://empireluxe.fr';A=D+'/cdn/shop/t/4/assets/'
+          routes=requests.get(A+'empire-routes.json?finish=20260914',timeout=25).json()
+          def get(u):
+            r=requests.get(u,timeout=25);r.raise_for_status();return r.text
+          def summary(h):
+            d=BeautifulSoup(h,'html.parser');m=d.select_one('main'); rec=d.select_one('[data-section-type="product-recommendations"]');model=d.select_one('#EmpirePreviewProduct')
+            def t(q):return [e.get_text(' ',strip=True) for e in m.select(q)] if m else []
+            return {'title':t('.product-single__title'),'price':t('[data-product-price]')[:1],'cards':t('.grid-product__title'),'cardPrices':t('.grid-product__price'),'reviews':t('.nolya-review-card__text'),'reviewNames':t('.nolya-review-card__name'),'options':[[i.get('name'),i.get('value')] for i in m.select('input[data-variant-input]')] if m else [],'model':bool(model),'recommendation':dict(rec.attrs) if rec else None,'liquid_error':'Liquid error' in h}
+          def pair(row):
+            path,view=row;name=view.split('view=')[-1];out={'path':path,'view':view}
+            try:
+              ref=get(R+path);draft=get(D+view+'&preview_theme_id=205091570007&finish=20260914');(O/(name+'-draft.html')).write_text(draft);(O/(name+'-reference.html')).write_text(ref)
+              a=summary(ref);b=summary(draft);out.update({'ref':a,'draft':b,'mismatch':[k for k in ['title','price','cards','cardPrices','reviews','reviewNames','options'] if a[k]!=b[k]]})
+            except Exception as e:out['error']=str(e)
+            return out
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:report=list(ex.map(pair,routes.items()))
+          (O/'report.json').write_text(json.dumps(report,ensure_ascii=False));print('Compared routes:',len(report),'Errors:',sum('error' in r for r in report))
+          ids=sorted(set(r['draft']['recommendation']['data-product-id'] for r in report if r.get('draft',{}).get('recommendation')))
+          (O/'recommendation-ids.json').write_text(json.dumps(ids));print('Recommendation sources:',len(ids))
+          def rec(i):
+            try:(O/('recommendations-'+i+'.html')).write_text(get(R+'/recommendations/products?section_id=product-recommendations&limit=5&product_id='+i))
+            except Exception as e:(O/('recommendations-'+i+'.error')).write_text(str(e))
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:list(ex.map(rec,ids))
+          for n in ['empire-search.js','empire-search.css']:
+            try:(O/n).write_text(get(A+n+'?finish=20260914'))
+            except:pass
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtG/6ZvkMwGrQ5KCE+duj
+          T25ZWOM2v3L3dE14jMMhM1lUioUdNxlzDOBozjfHZglnuGCRN5aAwr4h7yP08MlT
+          xH3m9b8K51Jx4mMoMHco8C0cuI/6HCf0ks29HOh7rUB8smOhKE4vAC9gjd8ev/Lw
+          Qhbv1o+mb680CK1jgxHACr0hRNTwm76g9CBLmrj1xhAdiBp/P/FW9eWblPBNdqZF
+          GI5qopC1+4Qrgiv1+9TJQRn7UOXtV33PfuniEaTPvB2udSz/YMZjIXizoy5rG0jX
+          9bmC2/SSFJd4UyJK9/+ePFYA91NSHWo+oZrbAPp5WWff6Tofm0w8feUozI5T36o2
+          NQIDAQAB
+          -----END PUBLIC KEY-----'''
+          buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in O.iterdir():z.write(p,p.name)
+          key=AESGCM.generate_key(bit_length=256);n=os.urandom(12);ek=serialization.load_pem_public_key(pub).encrypt(key,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('inventory.bin').write_bytes(b'EQA1'+ek+n+AESGCM(key).encrypt(n,buf.getvalue(),b'empire-qa'))
+          PY
+          python /tmp/run.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-inventory-encrypted
+          path: inventory.bin
+          retention-days: 2
