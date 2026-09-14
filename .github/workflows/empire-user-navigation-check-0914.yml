@@ -1,0 +1,97 @@
+name: Empire navigation final checks
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-user-navigation-check-0914.yml']
+permissions:
+  contents: read
+jobs:
+  navigation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Browser dependencies
+        run: |
+          pip -q install playwright cryptography
+          python -m playwright install --with-deps chromium >/dev/null
+      - name: Exercise same-tab navigation
+        run: |
+          cat > /tmp/test.py <<'PY'
+          from pathlib import Path
+          import json,time,traceback
+          from playwright.sync_api import sync_playwright
+          O=Path('evidence');O.mkdir();D='https://empireluxe.fr';T='205091570007';tests=[];details=[]
+          def put(n,v):(O/n).write_text(json.dumps(v,ensure_ascii=False,indent=2),encoding='utf-8')
+          def u(view=''):return D+'/?preview_theme_id='+T+('&view='+view if view else '')+'&nav_test=0914'
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True)
+            for w in [390,1440]:
+              ctx=browser.new_context(viewport={'width':w,'height':900},locale='fr-FR');page=ctx.new_page();page.set_default_timeout(8000);errors=[]
+              page.on('pageerror',lambda e:errors.append(str(e)))
+              page.add_init_script("try{sessionStorage.setItem('empire-review-qa','1')}catch{}")
+              def navigate(url):
+                page.goto(url,wait_until='domcontentloaded',timeout=30000);page.wait_for_timeout(1200)
+                page.evaluate("()=>{if(window.theme?.Modals){theme.Modals.prototype.open=function(){};}document.querySelectorAll('[id^=NewsletterPopup-]').forEach(e=>e.classList.remove('modal--is-active'));document.documentElement.classList.remove('modal-open');}")
+                page.add_style_tag(content='[id^="NewsletterPopup-"],#shopify-pc__banner{display:none!important}')
+                assert str(page.evaluate('window.Shopify.theme.id'))==T
+              def test(name,value):tests.append({'width':w,'test':name,'pass':bool(value)})
+              try:
+                navigate(u());page.locator('.js-drawer-open-nav:visible').click();page.wait_for_timeout(800)
+                test('menu opens',page.locator('#NavDrawer').evaluate("e=>e.classList.contains('drawer--is-open')"));page.screenshot(path=str(O/f'menu-{w}.png'))
+                details.append({'width':w,'nav':page.locator('#NavDrawer').evaluate("e=>({classes:e.className,rect:e.getBoundingClientRect().toJSON(),animation:getComputedStyle(e).animation,transform:getComputedStyle(e).transform})")})
+                page.locator('#NavDrawer .js-drawer-close').click(timeout=4000);page.wait_for_timeout(600);test('menu closes',not page.locator('#NavDrawer').evaluate("e=>e.classList.contains('drawer--is-open')"))
+              except Exception as e:details.append({'width':w,'navError':str(e)})
+              try:
+                navigate(u('p-91194e8eefcb'))
+                inp=page.locator('input[data-variant-input][value="42"]');page.locator('label[for="'+inp.get_attribute('id')+'"]').click();page.locator('form[data-empire-preview-product] button[name="add"]').click();page.wait_for_timeout(400)
+                state=page.evaluate('window.EmpirePreviewCart.snapshot()');test('size 42 added',state['item_count']==1 and str(state['items'][0]['variant'])=='42');test('eight product reviews',page.locator('.nolya-review-card').count()==8)
+                navigate(D+'/cart?preview_theme_id='+T);test('same-tab cart persists',page.locator('#EmpireCartPage [data-empire-line]').count()==1)
+                page.locator('#EmpireCartPage [data-empire-qty="1"]').first.click();test('cart quantity increase',page.evaluate('window.EmpirePreviewCart.snapshot().item_count')==2)
+                page.locator('#EmpireCartPage [data-empire-qty="-1"]').first.click();test('cart quantity decrease',page.evaluate('window.EmpirePreviewCart.snapshot().item_count')==1)
+                page.screenshot(path=str(O/f'cart-{w}.png'),full_page=True,animations='disabled')
+                page.locator('#EmpireCartPage [data-empire-remove]').first.click();test('cart removal',page.evaluate('window.EmpirePreviewCart.snapshot().item_count')==0 and page.locator('#EmpireCartEmpty').is_visible())
+                navigate(u('p-bce5e7eb05bc'));page.locator('[data-section-type="product-recommendations"]').scroll_into_view_if_needed();page.wait_for_timeout(1800)
+                test('five source recommendations',page.locator('[data-section-type="product-recommendations"] .grid-product').count()==5)
+                test('recently viewed appears',page.locator('[data-section-type="recently-viewed"] .grid-product').count()>=1)
+                rec=page.locator('[data-section-type="product-recommendations"]');rec.screenshot(path=str(O/f'recommendations-{w}.png'),animations='disabled');page.locator('[data-section-type="recently-viewed"]').screenshot(path=str(O/f'recent-{w}.png'),animations='disabled')
+                card=rec.locator('.grid-product').first;card.locator('.grid-product__image-mask').click();test('recommendation sizes reveal',card.locator('.grid-product__content').evaluate("e=>e.classList.contains('is-revealed')"));pill=card.locator('.grid-product__size-pill:not(.is-disabled)').first;pill.click();page.wait_for_timeout(2000);test('recommendation quick add',page.evaluate('window.EmpirePreviewCart.snapshot().item_count')==1)
+                details.append({'width':w,'cardImages':card.locator('img').evaluate_all("es=>es.map(e=>({src:e.currentSrc,width:e.naturalWidth,loaded:e.complete}))")})
+                navigate(D+'/search?q=cloudtilt&preview_theme_id='+T);page.wait_for_timeout(1500);test('search displays twelve cards',page.locator('#EmpireSearchOutput .grid-product').count()==12);test('no horizontal overflow',page.evaluate('document.documentElement.scrollWidth<=innerWidth'))
+                page.screenshot(path=str(O/f'search-{w}.png'),full_page=True,animations='disabled')
+              except Exception as e:details.append({'width':w,'flowError':str(e)})
+              details.append({'width':w,'errors':errors});put('tests.json',tests);put('details.json',details);ctx.close()
+            browser.close()
+          print('Passed',sum(t['pass'] for t in tests),'of',len(tests),'checks; details encrypted.')
+          PY
+          python /tmp/test.py
+      - name: Encrypt evidence
+        if: always()
+        run: |
+          python - <<'PY'
+          import io,zipfile,os
+          from pathlib import Path
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsgRG3rddyMv6rF4wzvG6
+          YcOwULAbhSDGWNkkwSOq9wWfjhGq3PpxsVWwjCp8l8Ng5kbXMtHW6oEfjedFY69c
+          yp+/tQTaRA6h+vi5Gky9lobksxifykUyJ/CB2OjMEUPJBx/hyuepd5wFxo9xrYyW
+          f+d9hhYMsnTcmfNs+8bD2BwbaoO/jqeNltKkYTwgd1WnjOZvWrguGpxA18Q6uw/Q
+          PYTmgC8bXFChxtqyyae/8FaZCP9AAbWLJ6b8SxCkor4MBEBQzALtDUGUQrz24DFy
+          bFhQ2rpC0IIwX5RdoT5H+TyOs8KwkzACWboob6XJdIXvFrCxRYoIOcyqy3owjuZ2
+          MwIDAQAB
+          -----END PUBLIC KEY-----'''
+          b=io.BytesIO()
+          with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in Path('evidence').rglob('*'):
+              if p.is_file():z.write(p,str(p.relative_to('evidence')))
+          k=AESGCM.generate_key(bit_length=256);n=os.urandom(12);ek=serialization.load_pem_public_key(pub).encrypt(k,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('navigation.bin').write_bytes(b'EQA1'+ek+n+AESGCM(k).encrypt(n,b.getvalue(),b'empire-qa'))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: navigation-evidence
+          path: navigation.bin
+          retention-days: 2
