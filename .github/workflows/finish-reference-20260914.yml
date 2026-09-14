@@ -1,0 +1,90 @@
+name: Finish reference integration
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/finish-reference-20260914.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install browser
+        run: |
+          pip -q install requests beautifulsoup4 playwright cryptography
+          python -m playwright install --with-deps chromium >/dev/null
+      - name: Collect read-only evidence
+        run: |
+          mkdir evidence
+          cat > /tmp/collect.py <<'PY'
+          import requests,json,re,concurrent.futures,time,io,zipfile,os
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from playwright.sync_api import sync_playwright
+          O=Path('evidence');R='https://on-cloudtilt.fr';D='https://empireluxe.fr';A=D+'/cdn/shop/t/4/assets/'
+          def save(n,s): (O/n).write_text(s,encoding='utf-8')
+          def get(u):
+            x=requests.get(u,timeout=25);x.raise_for_status();return x
+          assets=['empire-reference-manifest.json','empire-routes.json','empire-demo-catalogue.json','empire-source-theme.js','empire-source-theme.css','empire-source-vendor.js','empire-preview-runtime.js','empire-source-preview.js']
+          def asset(n):
+            try:save(n,get(A+n).text)
+            except Exception as e:save(n+'.error',str(e))
+          with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:list(ex.map(asset,assets))
+          samples={'home':'/','product':'/products/cloudtilt-remix-sunstone-ivory-femme','clothes':'/products/club-t','watch':'/products/swatch-x-audemars-piguet-bioceramic-royal-pop-huit-blanc-ssx03w100n','cart':'/cart','search':'/search?q=cloudtilt','shoes':'/collections/chaussures'}
+          routes=json.loads((O/'empire-routes.json').read_text())
+          def pair(t):
+            n,p=t
+            for side,url in [('reference',R+p),('draft',D+routes.get(p,p)+('&' if '?' in routes.get(p,p) else '?')+'preview_theme_id=205091570007')]:
+              try:save(n+'-'+side+'.html',get(url).text)
+              except Exception as e:save(n+'-'+side+'.error',str(e))
+          with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:list(ex.map(pair,samples.items()))
+          report={}
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch()
+            for side in ['reference','draft']:
+              ctx=browser.new_context(viewport={'width':390,'height':844},locale='fr-FR');page=ctx.new_page();ctx.set_default_timeout(5000);errors=[];net=[]
+              page.on('pageerror',lambda e:errors.append(str(e)))
+              def response(x):
+                if any(k in x.url for k in ['/recommendations/','.js?','view=ajax','view=recent']):
+                  try:net.append({'url':x.url,'status':x.status,'body':x.text()})
+                  except:pass
+              page.on('response',response)
+              for n in ['product','clothes','home']:
+                p=samples[n];u=R+p if side=='reference' else D+routes.get(p,p)+('&' if '?' in routes.get(p,p) else '?')+'preview_theme_id=205091570007'
+                page.goto(u,wait_until='domcontentloaded',timeout=30000);page.wait_for_timeout(1500)
+                page.add_style_tag(content='[id^="NewsletterPopup-"],#shopify-pc__banner,#preview-bar-iframe,#shopify-preview-bar-iframe{display:none!important}')
+                for y in range(0,min(16000,page.evaluate('document.documentElement.scrollHeight')),600):page.evaluate('(y)=>scrollTo(0,y)',y);page.wait_for_timeout(60)
+                page.wait_for_timeout(800);save(n+'-'+side+'-rendered.html',page.content())
+                report[side+'-'+n]=page.evaluate('''()=>({theme:Shopify.theme,headings:[...document.querySelectorAll('main h1,main h2,main h3')].map(e=>e.textContent.trim()),recent:window.theme?.recentlyViewed,overflow:document.documentElement.scrollWidth-innerWidth})''')
+                page.evaluate('scrollTo(0,0)');page.screenshot(path=str(O/(n+'-'+side+'.png')),full_page=True,timeout=20000)
+              save(side+'-requests.json',json.dumps(net));report[side+'-errors']=errors;ctx.close()
+            browser.close()
+          save('report.json',json.dumps(report))
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          pub=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtG/6ZvkMwGrQ5KCE+duj
+          T25ZWOM2v3L3dE14jMMhM1lUioUdNxlzDOBozjfHZglnuGCRN5aAwr4h7yP08MlT
+          xH3m9b8K51Jx4mMoMHco8C0cuI/6HCf0ks29HOh7rUB8smOhKE4vAC9gjd8ev/Lw
+          Qhbv1o+mb680CK1jgxHACr0hRNTwm76g9CBLmrj1xhAdiBp/P/FW9eWblPBNdqZF
+          GI5qopC1+4Qrgiv1+9TJQRn7UOXtV33PfuniEaTPvB2udSz/YMZjIXizoy5rG0jX
+          9bmC2/SSFJd4UyJK9/+ePFYA91NSHWo+oZrbAPp5WWff6Tofm0w8feUozI5T36o2
+          NQIDAQAB
+          -----END PUBLIC KEY-----'''
+          buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            for p in O.iterdir():z.write(p,p.name)
+          key=AESGCM.generate_key(bit_length=256);nonce=os.urandom(12)
+          enc=serialization.load_pem_public_key(pub).encrypt(key,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('evidence.bin').write_bytes(b'EQA1'+enc+nonce+AESGCM(key).encrypt(nonce,buf.getvalue(),b'empire-qa'))
+          print('Evidence collected; no store changes.')
+          PY
+          python /tmp/collect.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finish-reference-encrypted
+          path: evidence.bin
+          retention-days: 2
