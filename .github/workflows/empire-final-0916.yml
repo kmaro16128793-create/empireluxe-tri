@@ -1,0 +1,25 @@
+name: Empire repaired draft flows
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-final-0916.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright cryptography
+          python -m playwright install --with-deps chromium
+      - name: Verify actual saved draft with persistent sessions
+        run: python -u resume-final/check.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: empire-final-flow-evidence
+          path: final-evidence.bin
+          retention-days: 7
