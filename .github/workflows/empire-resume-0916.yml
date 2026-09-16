@@ -1,0 +1,105 @@
+name: Empire saved draft verification
+on:
+  push:
+    branches: [qa-shopify-20260913]
+    paths: ['.github/workflows/empire-resume-0916.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install browser verification tools
+        run: |
+          python -m pip install --quiet playwright pillow beautifulsoup4 requests cryptography
+          python -m playwright install --with-deps chromium
+      - name: Compare saved storefront pages
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('qa/verify_shopify.py')
+          s=p.read_text()
+          s=s.replace("min(height,24000)","min(height,16000)")
+          s=s.replace("[390,1440]","[390,1440]")
+          p.write_text(s)
+          PY
+          python -u qa/verify_shopify.py
+      - name: Capture current scripts and remaining interactive flows
+        if: always()
+        run: |
+          python - <<'PY'
+          import requests,json,time
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          out=Path('qa-evidence');out.mkdir(exist_ok=True)
+          assets=['empire-preview-runtime.js','empire-source-preview.js','empire-reference-bridge.js','empire-recommendations-data.js','empire-search.js','empire-search.css','empire-logo-integration.css','empire-source-theme.js','empire-source-theme.css','empire-routes.json','empire-demo-catalogue.json']
+          for name in assets:
+              r=requests.get('https://empireluxe.fr/cdn/shop/t/4/assets/'+name,timeout=20)
+              if r.ok:(out/name).write_bytes(r.content)
+          records=[]
+          with sync_playwright() as p:
+              b=p.chromium.launch()
+              for width in [390,1440]:
+                  c=b.new_context(viewport={'width':width,'height':900},locale='fr-FR')
+                  page=c.new_page();page.set_default_timeout(6000)
+                  errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+                  urls=[('product1','https://empireluxe.fr/?preview_theme_id=205091570007&view=p-91194e8eefcb'),('product2','https://empireluxe.fr/?preview_theme_id=205091570007&view=p-e6feedea5515'),('search','https://empireluxe.fr/search?q=Cloudtilt&preview_theme_id=205091570007'),('cart','https://empireluxe.fr/cart?preview_theme_id=205091570007')]
+                  for label,url in urls:
+                      try:
+                          page.goto(url,wait_until='domcontentloaded',timeout=25000);page.wait_for_timeout(1800)
+                          page.add_style_tag(content='[id^="NewsletterPopup-"],#shopify-pc__banner,#shopify-preview-bar-iframe,#OnlineStorePreviewBarIframe{display:none!important}')
+                          page.evaluate('window.scrollTo(0,document.body.scrollHeight)');page.wait_for_timeout(1200)
+                          record={'width':width,'label':label,'errors':errors[:],'theme':page.evaluate('window.Shopify.theme'),'metrics':page.evaluate('''()=>({overflow:document.documentElement.scrollWidth>innerWidth,recent:[...document.querySelectorAll('[data-section-type="recently-viewed"]')].map(e=>({visible:!!e.getBoundingClientRect().height,items:e.querySelectorAll('.grid-product').length,text:e.innerText})),recommendations:[...document.querySelectorAll('[data-section-type="product-recommendations"]')].map(e=>({visible:!!e.getBoundingClientRect().height,items:e.querySelectorAll('.grid-product').length,text:e.innerText})),searchResults:document.getElementById('EmpireSearchOutput')?.dataset.empireResults,headings:[...document.querySelectorAll('main h1,main h2,main h3')].map(e=>e.innerText)})''')}
+                          if label=='product1':
+                              page.locator('input[data-variant-input][value="42"]').check(force=True)
+                              page.locator('form[data-empire-preview-product] button[name="add"]').click(force=True);page.wait_for_timeout(400)
+                              record['cartAfterAdd']=page.evaluate('window.EmpirePreviewCart.snapshot()')
+                          if label=='cart':
+                              row=page.locator('#EmpireCartPage [data-empire-line]').first
+                              record['cart']=page.evaluate('window.EmpirePreviewCart.snapshot()')
+                              if row.count():
+                                  row.locator('[data-empire-qty="1"]').click(force=True);record['cartIncrement']=page.evaluate('window.EmpirePreviewCart.snapshot()')
+                                  page.locator('#EmpireCartPage [name="checkout"]').click(force=True)
+                                  record['checkoutNotice']=page.locator('#EmpireCartPage [data-empire-demo-note]').inner_text()
+                          (out/f'extra-{width}-{label}.html').write_text(page.content())
+                          page.evaluate('window.scrollTo(0,0)');page.screenshot(path=str(out/f'extra-{width}-{label}.png'),full_page=True,timeout=25000)
+                          records.append(record)
+                      except Exception as e:records.append({'width':width,'label':label,'error':str(e)[:300]})
+                  c.close()
+              b.close()
+          (out/'extra-flows.json').write_text(json.dumps(records,ensure_ascii=False,indent=2))
+          PY
+      - name: Encrypt evidence
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import io,zipfile,os
+          from cryptography.hazmat.primitives import serialization,hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          public=b'''-----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr0VAc8COI3vxCz0CCJEy
+          Q8jV8iODPTV550+X3ngGQ1WnNHgygmJKAC2JuAaG2LINH591lMaXkfF95Box1JiU
+          aHvO2wKFrAkZKJoxjif9qngN3yiucgFvciusLYjInegEiUIMoE55+fsBYFBI804w
+          fULGGd0TK2CCx5HBKWvyJfzxrx8eOOjeZ9sVHYqQDtyBUosLx7I6kQ1bbYJM/sKw
+          lz6mplvgF97PbGACuRT8XClVV/S8xcYa6o+2GzWimHAKLZ3okA5H4wgZ/kusktmo
+          /u3J5L0znFCkniiMwCc8dzUt03lWXjpPNu5S+TlkmB2trUiY98hwyHU44RT341Ls
+          mwIDAQAB
+          -----END PUBLIC KEY-----'''
+          key=serialization.load_pem_public_key(public);buf=io.BytesIO()
+          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+              for f in Path('qa-evidence').rglob('*'):
+                  if f.is_file():z.write(f,str(f.relative_to('qa-evidence')))
+          secret=AESGCM.generate_key(bit_length=256);nonce=os.urandom(12)
+          wrapped=key.encrypt(secret,padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+          Path('evidence.bin').write_bytes(b'EQA1'+wrapped+nonce+AESGCM(secret).encrypt(nonce,buf.getvalue(),b'empire-qa'))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: empire-saved-draft-encrypted
+          path: evidence.bin
+          retention-days: 7
